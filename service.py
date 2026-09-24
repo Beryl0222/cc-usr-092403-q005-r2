@@ -2,6 +2,10 @@
 
 除健康检查外提供 JSON API（详见 README「接口一览」）。仓储默认在内存中，
 设置环境变量 LAB_DATA_FILE 后会把只增证据快照落盘，重启自动恢复。
+
+访问控制：需要鉴权的接口通过请求体或查询参数 ``actor_id`` 表明身份；
+监管/复核角色可看全量并握有复发确认权，责任方只能访问自己绑定的主体材料，
+越权返回 403。
 """
 
 import argparse
@@ -9,12 +13,13 @@ import json
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from domain import (
     DomainError,
     Lab,
     NotFoundError,
+    PermissionError_,
 )
 
 SERVICE_ID = "mobile-ad-audit"
@@ -68,6 +73,12 @@ def reset_store(path=None):
     return STORE
 
 
+def _query_actor(query):
+    params = parse_qs(query)
+    rows = params.get("actor_id") or []
+    return rows[0] if rows else None
+
+
 class Handler(BaseHTTPRequestHandler):
     """提供健康检查与合规实验室 JSON API。"""
 
@@ -92,7 +103,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not_found", "message": "未知接口"})
 
     def do_GET(self):
-        path = urlsplit(self.path).path.rstrip("/") or "/"
+        split = urlsplit(self.path)
+        path = split.path.rstrip("/") or "/"
         try:
             if path == "/health":
                 self._send_json(200, health_payload())
@@ -105,6 +117,20 @@ class Handler(BaseHTTPRequestHandler):
                 build_id = unquote(path[len("/builds/"):-len("/report")])
                 self._send_json(200, STORE.call(STORE.lab.build_report, build_id))
                 return
+            if path.startswith("/builds/") and path.endswith("/oversight"):
+                build_id = unquote(path[len("/builds/"):-len("/oversight")])
+                actor_id = _query_actor(split.query)
+                self._send_json(
+                    200,
+                    STORE.call(STORE.lab.oversight_build_view, build_id, actor_id),
+                )
+                return
+            if path == "/materials":
+                actor_id = _query_actor(split.query)
+                self._send_json(
+                    200, STORE.call(STORE.lab.responsible_materials, actor_id)
+                )
+                return
             if path.startswith("/subjects/"):
                 parts = path.split("/")
                 if len(parts) != 4:
@@ -113,12 +139,16 @@ class Handler(BaseHTTPRequestHandler):
                 # /subjects/{type}/{id}
                 subject_type, subject_id = parts[2], unquote(parts[3])
                 self._send_json(
-                    200, STORE.call(STORE.lab.subject_view, subject_type, subject_id)
+                    200,
+                    STORE.call(STORE.lab.subject_view, subject_type, subject_id,
+                               _query_actor(split.query)),
                 )
                 return
             self._json_404()
         except NotFoundError as exc:
             self._send_json(404, {"error": "not_found", "message": str(exc)})
+        except PermissionError_ as exc:
+            self._send_json(403, {"error": "forbidden", "message": str(exc)})
         except DomainError as exc:
             self._send_json(400, {"error": "domain_error", "message": str(exc)})
 
@@ -137,11 +167,20 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/devices":
                 self._send_json(201, STORE.call(lab.register_device, payload, persist=True))
                 return
+            if path == "/components":
+                self._send_json(201, STORE.call(lab.register_component, payload, persist=True))
+                return
+            if path == "/actors":
+                self._send_json(201, STORE.call(lab.register_actor, payload, persist=True))
+                return
             if path == "/builds":
                 self._send_json(201, STORE.call(lab.register_build, payload, persist=True))
                 return
             if path == "/tasks":
                 self._send_json(201, STORE.call(lab.create_task, payload, persist=True))
+                return
+            if path == "/escalations/scan":
+                self._send_json(200, STORE.call(lab.escalate_overdue, payload, persist=True))
                 return
 
             if path.startswith("/tasks/"):
@@ -161,6 +200,27 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/findings/") and path.endswith("/review"):
                 finding_id = unquote(path[len("/findings/"):-len("/review")].rstrip("/"))
                 self._send_json(200, STORE.call(lab.review_finding, finding_id, payload, persist=True))
+                return
+
+            if path.startswith("/items/") and path.endswith("/commitments"):
+                item_id = unquote(path[len("/items/"):-len("/commitments")].rstrip("/"))
+                self._send_json(
+                    201, STORE.call(lab.commit_rectification, item_id, payload, persist=True)
+                )
+                return
+
+            if path.startswith("/builds/") and path.endswith("/relapse-proposals"):
+                build_id = unquote(path[len("/builds/"):-len("/relapse-proposals")])
+                self._send_json(
+                    201, STORE.call(lab.propose_relapses_for_build, build_id, persist=True)
+                )
+                return
+
+            if path.startswith("/relapses/") and path.endswith("/decision"):
+                relapse_id = unquote(path[len("/relapses/"):-len("/decision")].rstrip("/"))
+                self._send_json(
+                    200, STORE.call(lab.decide_relapse, relapse_id, payload, persist=True)
+                )
                 return
 
             if path.startswith("/subjects/"):
@@ -185,6 +245,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json_404()
         except NotFoundError as exc:
             self._send_json(404, {"error": "not_found", "message": str(exc)})
+        except PermissionError_ as exc:
+            self._send_json(403, {"error": "forbidden", "message": str(exc)})
         except DomainError as exc:
             self._send_json(400, {"error": "domain_error", "message": str(exc)})
 

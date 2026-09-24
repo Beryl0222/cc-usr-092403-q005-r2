@@ -177,6 +177,12 @@ class ApiFlowTest(unittest.TestCase):
         self.assertEqual(view["relapse_count"], 0)
         self.assertEqual(view["cycles"][0]["problem_period"]["first_observed_at"], NOW + 100)
         self.assertEqual(view["cycles"][0]["notices"][0]["finding_count"], 1)
+        # 复测固化脚本/规则/设备/构建摘要
+        retest_snap = view["cycles"][0]["retests"][0]["snapshot"]
+        self.assertEqual(retest_snap["regulation_version"], "v2025.1")
+        self.assertEqual(retest_snap["script"]["version"], "1.0")
+        self.assertEqual(retest_snap["build"]["build_id"], f"{APP_ID}:1002")
+        self.assertEqual(retest_snap["device"]["device_id"], "dev-A")
 
         # 回潮：1003 版恢复旧行为
         self.post("/builds", 201, {
@@ -194,7 +200,7 @@ class ApiFlowTest(unittest.TestCase):
 
         view = self.get(f"/subjects/app/{APP_ID}")
         self.assertEqual(view["status"], "open")
-        self.assertEqual(view["relapse_count"], 1)
+        self.assertEqual(view["relapse_count"], 0)  # 人工确认前不计数
         self.assertEqual(len(view["cycles"]), 2)
         self.assertEqual(view["current_cycle_seq"], 2)
         # 旧周期完整保留，旧构建证据仍可查
@@ -202,12 +208,106 @@ class ApiFlowTest(unittest.TestCase):
         old = self.get(f"/tasks/{normal['task_id']}")
         self.assertEqual(old["build"]["version_code"], 1001)
 
+        # 系统按行为指纹提议复发，审核员确认后才计数；责任方无权确认（403）
+        self.post("/actors", 201, {"actor_id": "rev", "role": "reviewer", "name": "复核员乙"})
+        self.post("/actors", 201, {"actor_id": "owner", "role": "responsible",
+                                   "subjects": [{"type": "app", "id": APP_ID}]})
+        proposals = self.post(f"/builds/{APP_ID}:1003/relapse-proposals", 201, {})
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]["status"], "proposed")
+        relapse_id = proposals[0]["relapse_id"]
+        status, _ = call("POST", f"{self.base}/relapses/{relapse_id}/decision",
+                         {"actor_id": "owner", "decision": "confirmed"})
+        self.assertEqual(status, 403)
+        self.post(f"/relapses/{relapse_id}/decision", 200,
+                  {"actor_id": "rev", "decision": "confirmed", "comment": "回潮成立"})
+        view = self.get(f"/subjects/app/{APP_ID}")
+        self.assertEqual(view["relapse_count"], 1)
+
+        # 监管构建视角：复发依据与通知回执
+        oversight = self.get(f"/builds/{APP_ID}:1003/oversight?actor_id=rev")
+        self.assertTrue(any(r["relapse_id"] == relapse_id
+                            for r in oversight["relapse_links"]))
+        self.assertTrue(oversight["notification_receipts"])
+
+        # 复测幂等：同一复测任务并发/重复提交只产生一次记录
+        dup1 = self.post(f"/subjects/app/{APP_ID}/retests", 201,
+                         {"task_id": relapse_task["task_id"]})
+        dup2 = self.post(f"/subjects/app/{APP_ID}/retests", 201,
+                         {"task_id": relapse_task["task_id"]})
+        self.assertEqual(dup2["retest_id"], dup1["retest_id"])
+        view = self.get(f"/subjects/app/{APP_ID}")
+        self.assertEqual(len(view["cycles"][1]["retests"]), 1)
+
+        # 责任方只能取自己名下材料，越权查看返回 403
+        mine = self.get("/materials?actor_id=owner")
+        self.assertEqual(len(mine["subjects"]), 1)
+        status, _ = call("GET", f"{self.base}/subjects/sdk/{SDK_ID}?actor_id=owner")
+        self.assertEqual(status, 403)
+
         # 非法输入与未知路由
         status, body = call("POST", f"{self.base}/tasks",
                             {"build_id": "missing", "device_id": "dev-A", "track": "normal"})
         self.assertEqual(status, 404)
         status, _ = call("GET", f"{self.base}/unknown")
         self.assertEqual(status, 404)
+
+    def test_commitment_item_close_and_overdue_escalation(self):
+        self._seed()
+        task = self._create_task("dev-A", "normal")
+        # 两条广告位各有一处关闭路径缺陷，均归应用方 -> 两个整改项
+        self.post(f"/tasks/{task['task_id']}/events", 202, {"events": [
+            ad("a1"), close("a1", 2, after=5, size=36),
+            ad("a4", placement="interstitial"),
+            close("a4", 6, after=6, size=30)]})
+        self.post(f"/tasks/{task['task_id']}/complete", 200, {})
+        report = self.get(f"/tasks/{task['task_id']}")
+        close_findings = [f for f in report["findings"] if f["rule_id"] == "R-CLOSE-001"]
+        self.assertEqual(len(close_findings), 2)
+        for f in close_findings:
+            self.post(f"/findings/{f['finding_id']}/review", 200,
+                      {"decision": "confirmed", "reviewer": "复核员乙"})
+        self.post(f"/subjects/app/{APP_ID}/notices", 201, {"issued_by": "承办人甲"})
+        view = self.get(f"/subjects/app/{APP_ID}")
+        items = view["cycles"][0]["items"]
+        self.assertEqual(len(items), 2)
+        close_item = items[0]
+        other_item = items[1]
+
+        # 承诺一条已逾期（补登承诺时间在过去），另一条不承诺
+        self.post("/builds", 201, {
+            "app_id": APP_ID, "app_name": "某新闻", "developer": "某新闻运营有限公司",
+            "version_code": 1002, "version_name": "8.2.0"})
+        item_resp = self.post(f"/items/{close_item['item_id']}/commitments", 201, {
+            "target_build_id": f"{APP_ID}:1002", "target_track": "normal",
+            "rectification_days": 2, "committed_by": "整改负责人丁",
+            "committed_at": NOW})  # NOW+2d 早于当前真实时间，已逾期
+        self.assertEqual(item_resp["status"], "committed")
+
+        # 逾期扫描：只升级关闭路径这一项；重复扫描不重复升级
+        scan = self.post("/escalations/scan", 200, {"issued_by": "督办系统"})
+        self.assertEqual(scan["escalated_count"], 1)
+        self.assertEqual(scan["escalated"][0]["item_id"], close_item["item_id"])
+        self.assertEqual(scan["escalated"][0]["subject"]["id"], APP_ID)
+        self.assertEqual(self.post("/escalations/scan", 200, {})["escalated_count"], 0)
+        view = self.get(f"/subjects/app/{APP_ID}")
+        closed = next(i for i in view["cycles"][0]["items"]
+                      if i["item_id"] == close_item["item_id"])
+        self.assertEqual(len(closed["escalations"]), 1)
+        self.assertTrue(any(n["kind"] == "escalation" for n in view["notifications"]))
+
+        # 定向复测只关闭承诺项，周期保持开启
+        rt = self.post("/tasks", 201,
+                       {"build_id": f"{APP_ID}:1002", "device_id": "dev-A", "track": "normal"})
+        self.post(f"/tasks/{rt['task_id']}/events", 202,
+                  {"events": [ad("c1"), close("c1", 2, after=1, size=48)]})
+        self.post(f"/tasks/{rt['task_id']}/complete", 200, {})
+        retest = self.post(f"/subjects/app/{APP_ID}/retests", 201,
+                           {"task_id": rt["task_id"]})
+        self.assertEqual(retest["passed_item_ids"], [close_item["item_id"]])
+        self.assertNotIn(other_item["item_id"], retest["passed_item_ids"])
+        view = self.get(f"/subjects/app/{APP_ID}")
+        self.assertEqual(view["cycles"][0]["status"], "open")
 
     def test_snapshot_file_persistence(self):
         fd, path = tempfile.mkstemp(prefix="lab-", suffix=".json")

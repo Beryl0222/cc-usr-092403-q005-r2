@@ -1,7 +1,12 @@
 """移动广告合规实验室的 HTTP 入口。
 
 除健康检查外提供 JSON API（详见 README「接口一览」）。仓储默认在内存中，
-设置环境变量 LAB_DATA_FILE 后会把只增证据快照落盘，重启自动恢复。
+设置环境变量 LAB_DATA_FILE 后会把只增证据快照落盘，重启自动恢复并接续待复测。
+
+访问角色通过请求头声明：
+* X-Role: regulator | reviewer —— 监管人员/复核员，可复核、出告知、审复发、看全局；
+* X-Role: party 且 X-Subject-Type/X-Subject-Id 指定主体 —— 责任方，只能取得
+  本主体的整改材料（广告主看不到他人材料）。
 """
 
 import argparse
@@ -12,9 +17,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from domain import (
+    AccessDeniedError,
     DomainError,
     Lab,
     NotFoundError,
+    ROLE_PARTY,
 )
 
 SERVICE_ID = "mobile-ad-audit"
@@ -88,44 +95,84 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as exc:
             raise DomainError(f"请求体不是合法 JSON：{exc}")
 
+    def _actor(self):
+        """从请求头解析访问角色；缺省视为监管人员（兼容既有内部调用）。"""
+        role = self.headers.get("X-Role", "regulator")
+        actor = {"role": role, "id": self.headers.get("X-Actor-Id", "")}
+        subject_type = self.headers.get("X-Subject-Type")
+        subject_id = self.headers.get("X-Subject-Id")
+        if subject_type and subject_id:
+            actor["subject_type"] = subject_type
+            actor["subject_id"] = subject_id
+        if role == ROLE_PARTY and not (subject_type and subject_id):
+            raise AccessDeniedError("责任方访问必须携带 X-Subject-Type 与 X-Subject-Id")
+        return actor
+
     def _json_404(self):
         self._send_json(404, {"error": "not_found", "message": "未知接口"})
+
+    def _send_error(self, exc):
+        if isinstance(exc, AccessDeniedError):
+            self._send_json(403, {"error": "access_denied", "message": str(exc)})
+        elif isinstance(exc, NotFoundError):
+            self._send_json(404, {"error": "not_found", "message": str(exc)})
+        elif isinstance(exc, DomainError):
+            self._send_json(400, {"error": "domain_error", "message": str(exc)})
+        else:
+            raise exc
 
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
         try:
+            actor = self._actor()
             if path == "/health":
                 self._send_json(200, health_payload())
                 return
             if path.startswith("/tasks/"):
                 task_id = unquote(path.split("/", 2)[2])
-                self._send_json(200, STORE.call(STORE.lab.task_report, task_id))
+                self._send_json(
+                    200, STORE.call(STORE.lab.task_report, task_id, actor=actor))
                 return
             if path.startswith("/builds/") and path.endswith("/report"):
                 build_id = unquote(path[len("/builds/"):-len("/report")])
-                self._send_json(200, STORE.call(STORE.lab.build_report, build_id))
+                self._send_json(
+                    200, STORE.call(STORE.lab.build_report, build_id, actor=actor))
+                return
+            if path.startswith("/builds/") and path.endswith("/oversight"):
+                build_id = unquote(path[len("/builds/"):-len("/oversight")])
+                self._send_json(
+                    200, STORE.call(STORE.lab.oversight_build, build_id, actor=actor))
                 return
             if path.startswith("/subjects/"):
                 parts = path.split("/")
-                if len(parts) != 4:
-                    self._json_404()
+                if len(parts) == 4:
+                    # /subjects/{type}/{id}
+                    subject_type, subject_id = parts[2], unquote(parts[3])
+                    self._send_json(
+                        200,
+                        STORE.call(STORE.lab.subject_view, subject_type, subject_id,
+                                   actor=actor),
+                    )
                     return
-                # /subjects/{type}/{id}
-                subject_type, subject_id = parts[2], unquote(parts[3])
-                self._send_json(
-                    200, STORE.call(STORE.lab.subject_view, subject_type, subject_id)
-                )
+                if len(parts) == 5 and parts[4] == "materials":
+                    subject_type, subject_id = parts[2], unquote(parts[3])
+                    self._send_json(
+                        200,
+                        STORE.call(STORE.lab.party_materials, subject_type, subject_id,
+                                   actor=actor),
+                    )
+                    return
+                self._json_404()
                 return
             self._json_404()
-        except NotFoundError as exc:
-            self._send_json(404, {"error": "not_found", "message": str(exc)})
-        except DomainError as exc:
-            self._send_json(400, {"error": "domain_error", "message": str(exc)})
+        except (AccessDeniedError, NotFoundError, DomainError) as exc:
+            self._send_error(exc)
 
     def do_POST(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
         try:
             payload = self._read_json()
+            actor = self._actor()
             lab = STORE.lab
 
             if path == "/admin/regulations":
@@ -142,6 +189,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/tasks":
                 self._send_json(201, STORE.call(lab.create_task, payload, persist=True))
+                return
+            if path == "/admin/overdue-checks":
+                self._send_json(200, STORE.call(lab.run_overdue_checks, payload,
+                                                actor=actor, persist=True))
+                return
+            if path == "/admin/retests/process-due":
+                self._send_json(200, STORE.call(lab.process_due_retests, actor=actor,
+                                                persist=True))
                 return
 
             if path.startswith("/tasks/"):
@@ -160,33 +215,47 @@ class Handler(BaseHTTPRequestHandler):
 
             if path.startswith("/findings/") and path.endswith("/review"):
                 finding_id = unquote(path[len("/findings/"):-len("/review")].rstrip("/"))
-                self._send_json(200, STORE.call(lab.review_finding, finding_id, payload, persist=True))
+                self._send_json(200, STORE.call(lab.review_finding, finding_id, payload,
+                                                actor=actor, persist=True))
+                return
+
+            if path.startswith("/relapses/") and path.endswith("/decision"):
+                relapse_id = unquote(path[len("/relapses/"):-len("/decision")].rstrip("/"))
+                self._send_json(200, STORE.call(lab.decide_relapse, relapse_id, payload,
+                                                actor=actor, persist=True))
                 return
 
             if path.startswith("/subjects/"):
                 parts = path.split("/")
-                # /subjects/{type}/{id}/notices | /retests
-                if len(parts) != 5 or parts[4] not in ("notices", "retests"):
+                # /subjects/{type}/{id}/{notices|retests|commitments}
+                if len(parts) != 5 or parts[4] not in (
+                        "notices", "retests", "commitments"):
                     self._json_404()
                     return
                 subject_type, subject_id = parts[2], unquote(parts[3])
                 if parts[4] == "notices":
                     self._send_json(
                         201,
-                        STORE.call(lab.generate_notice, subject_type, subject_id, payload, persist=True),
+                        STORE.call(lab.generate_notice, subject_type, subject_id, payload,
+                                   actor=actor, persist=True),
+                    )
+                elif parts[4] == "commitments":
+                    self._send_json(
+                        201,
+                        STORE.call(lab.submit_commitment, subject_type, subject_id, payload,
+                                   actor=actor, persist=True),
                     )
                 else:
                     self._send_json(
                         201,
-                        STORE.call(lab.record_retest, subject_type, subject_id, payload, persist=True),
+                        STORE.call(lab.record_retest, subject_type, subject_id, payload,
+                                   actor=actor, persist=True),
                     )
                 return
 
             self._json_404()
-        except NotFoundError as exc:
-            self._send_json(404, {"error": "not_found", "message": str(exc)})
-        except DomainError as exc:
-            self._send_json(400, {"error": "domain_error", "message": str(exc)})
+        except (AccessDeniedError, NotFoundError, DomainError) as exc:
+            self._send_error(exc)
 
     def log_message(self, *_args):
         return
